@@ -8,7 +8,6 @@ type CabinMode = 'idle' | 'pose-confirm' | 'recharge' | 'inspiration' | 'ending'
 type MobileState = 'home' | 'modeSelect' | 'activeInCabin' | 'result' | 'cardsView';
 
 interface Ripple { id: number; x: number; y: number; }
-// 能量球新增了 size 属性
 interface EnergyBall { id: number; isConsumed: boolean; x: number; y: number; size: number; }
 interface SessionResult { mode: string; percent: number; score: string; cards: number; }
 
@@ -20,12 +19,73 @@ const INSPIRATION_DB =[
 ];
 
 // ==========================================
+// 全新功能：沉浸式白噪音引擎 (Web Audio API 生成，无需外部文件)
+// ==========================================
+const useBackgroundNoise = (isPlaying: boolean) => {
+  useEffect(() => {
+    if (!isPlaying) return;
+    
+    let audioCtx: AudioContext;
+    let gainNode: GainNode;
+    let noiseSource: AudioBufferSourceNode;
+
+    try {
+      // @ts-ignore
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioCtx = new AudioContext();
+      const bufferSize = audioCtx.sampleRate * 2; 
+      const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+      const data = buffer.getChannelData(0);
+      
+      // 生成高级的低频/粉红噪音（比普通白噪音更温和、像深空或轻柔的海浪）
+      let lastOut = 0;
+      for (let i = 0; i < bufferSize; i++) {
+        const white = Math.random() * 2 - 1;
+        data[i] = (lastOut + (0.02 * white)) / 1.02; // Brown noise filter
+        lastOut = data[i];
+        data[i] *= 3.5; // 音量补偿
+      }
+
+      noiseSource = audioCtx.createBufferSource();
+      noiseSource.buffer = buffer;
+      noiseSource.loop = true;
+
+      // 加入低通滤波器，滤掉刺耳的高频，只保留沉浸的低鸣
+      const filter = audioCtx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.value = 600; 
+
+      // 音量控制节点（实现淡入淡出）
+      gainNode = audioCtx.createGain();
+      gainNode.gain.setValueAtTime(0, audioCtx.currentTime);
+      gainNode.gain.linearRampToValueAtTime(0.2, audioCtx.currentTime + 3); // 3秒温柔淡入
+
+      noiseSource.connect(filter);
+      filter.connect(gainNode);
+      gainNode.connect(audioCtx.destination);
+      noiseSource.start();
+    } catch (e) {
+      console.error("Audio Context failed", e);
+    }
+
+    return () => {
+      if (gainNode && audioCtx) {
+        gainNode.gain.linearRampToValueAtTime(0, audioCtx.currentTime + 1.5); // 1.5秒淡出
+        setTimeout(() => {
+          if (noiseSource) noiseSource.stop();
+          if (audioCtx.state !== 'closed') audioCtx.close();
+        }, 1500);
+      }
+    };
+  }, [isPlaying]);
+};
+
+// ==========================================
 // 1. SYNC Logo 组件
 // ==========================================
 const SyncLogo = ({ size = 'large', className = '', isSyncing = false }: { size?: 'large' | 'small', className?: string, isSyncing?: boolean }) => {
   const baseSize = size === 'large' ? 160 : 80;
   const midSize = size === 'large' ? 120 : 60;
-  
   const dots =[
     { size: 4, y: -45, x: 0 }, { size: 6, y: -25, x: 10 }, { size: 8, y: -5, x: 15 },
     { size: 10, y: 15, x: 15 }, { size: 8, y: 35, x: 10 }, { size: 6, y: 55, x: 0 }, { size: 4, y: 75, x: -10 },
@@ -34,7 +94,7 @@ const SyncLogo = ({ size = 'large', className = '', isSyncing = false }: { size?
   return (
     <div className={`sync-totem flex items-center justify-center w-full ${!isSyncing ? 'breathing' : ''} ${className}`}>
       <div className="flex items-center justify-center relative" style={{ transform: 'translateX(-4%)' }}>
-        <motion.div animate={isSyncing ? { scale: [1, 0.95, 1], opacity:[0.9, 0.7, 0.9] } : {}} transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
+        <motion.div animate={isSyncing ? { scale:[1, 0.95, 1], opacity:[0.9, 0.7, 0.9] } : {}} transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
           className="sync-circle relative z-20" style={{ width: `${baseSize}px`, height: `${baseSize}px`, background: 'linear-gradient(to left, #4FACFE 0%, rgba(255, 255, 255, 0.9) 100%)' }} />
         <motion.div animate={isSyncing ? { scale:[1, 0.9, 1], opacity:[0.8, 0.6, 0.8] } : {}} transition={{ duration: 3, repeat: Infinity, ease: "easeInOut" }}
           className="sync-circle relative z-10" style={{ width: `${midSize}px`, height: `${midSize}px`, marginLeft: size === 'large' ? '-2px' : '-1px', background: 'linear-gradient(to right, #4FACFE 0%, rgba(255, 255, 255, 0.9) 100%)' }} />
@@ -53,23 +113,27 @@ const SyncLogo = ({ size = 'large', className = '', isSyncing = false }: { size?
 };
 
 // ==========================================
-// 2. 交互舱 UI 
+// 2. 交互舱 UI (带音频引擎和脉冲光晕衰减)
 // ==========================================
 const CabinUI = ({ 
   cabinMode, setCabinMode, targetMode, addCard, timeElapsed, endSession
 }: { 
   cabinMode: CabinMode, setCabinMode: (m: CabinMode) => void, targetMode: CabinMode | null, addCard: (t: string) => void, timeElapsed: number, endSession: () => void 
 }) => {
-  const[isPressing, setIsPressing] = useState(false);
+  const [isPressing, setIsPressing] = useState(false);
   const [confirmProgress, setConfirmProgress] = useState(0);
   const [pushProgress, setPushProgress] = useState(0);
   const [balls, setBalls] = useState<EnergyBall[]>([]);
   const [randomSpots, setRandomSpots] = useState<{id: number, deg: number, size: number}[]>([]);
   const [ripples, setRipples] = useState<Ripple[]>([]);
   const [isListening, setIsListening] = useState(false);
-  const [recordFeedback, setRecordFeedback] = useState("");
+  const[recordFeedback, setRecordFeedback] = useState("");
   const rippleIdRef = useRef(0);
 
+  // 挂载白噪音发生器（仅在正式体验中播放）
+  useBackgroundNoise(cabinMode === 'recharge' || cabinMode === 'inspiration');
+
+  // 语音识别逻辑
   useEffect(() => {
     if (cabinMode === 'idle' || cabinMode === 'pose-confirm' || cabinMode === 'ending') return;
     // @ts-ignore
@@ -98,16 +162,14 @@ const CabinUI = ({
     setTimeout(() => setRecordFeedback(""), 3000);
   };
 
+  // 姿态确认
   useEffect(() => {
     let interval: NodeJS.Timeout;
     if (cabinMode === 'pose-confirm') {
       if (isPressing) {
         interval = setInterval(() => {
           setConfirmProgress(p => {
-            if (p >= 100 && targetMode) {
-              setCabinMode(targetMode);
-              return 100;
-            }
+            if (p >= 100 && targetMode) { setCabinMode(targetMode); return 100; }
             return p + 2;
           });
         }, 30);
@@ -129,32 +191,30 @@ const CabinUI = ({
     return `${m}:${s}`;
   };
 
-  // 精神充能：更柔和的生成动画，大大小小的错落尺寸
+  // 光晕自然衰减逻辑（修复光晕不消失的问题）
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (pushProgress > 0) {
+      // 每 40ms 让光晕进度减少一点，形成自然消散的呼吸感
+      interval = setInterval(() => setPushProgress(p => Math.max(p - 2, 0)), 40);
+    }
+    return () => clearInterval(interval);
+  }, [pushProgress]);
+
+  // 精神充能小球生成
   useEffect(() => {
     if (cabinMode === 'recharge') {
-      const generateNewBalls = () => {
-        return [...Array(5)].map((_, i) => ({ 
-          id: Math.random(), 
-          isConsumed: false, 
-          x: (Math.random() - 0.5) * 600, // 横向更散开
-          y: (Math.random() - 0.5) * 300 - 50, // 稍微偏上一点
-          size: 0.6 + Math.random() * 0.6 // 尺寸随机 0.6 到 1.2
-        }));
-      };
-
-      if (balls.length === 0) {
-        setBalls(generateNewBalls());
-      } else if (balls.every(b => b.isConsumed)) {
-        setTimeout(() => {
-          setBalls(generateNewBalls());
-        }, 1000); // 等待1秒后如晨露般浮现
-      }
+      const generateNewBalls = () => [...Array(5)].map((_, i) => ({ 
+        id: Math.random(), isConsumed: false, x: (Math.random() - 0.5) * 600, y: (Math.random() - 0.5) * 300 - 50, size: 0.6 + Math.random() * 0.6 
+      }));
+      if (balls.length === 0) setBalls(generateNewBalls());
+      else if (balls.every(b => b.isConsumed)) setTimeout(() => setBalls(generateNewBalls()), 1000);
     } else {
-      setBalls([]);
-      setPushProgress(0);
+      setBalls([]); setPushProgress(0);
     }
   },[cabinMode, balls]);
 
+  // 灵感跳跃生成
   useEffect(() => {
     if (cabinMode === 'inspiration') {
       const generateSpots = () => setRandomSpots([
@@ -177,7 +237,6 @@ const CabinUI = ({
     const newRipple = { id: rippleIdRef.current++, x: e.clientX, y: e.clientY };
     setRipples(prev =>[...prev, newRipple]);
     setTimeout(() => setRipples(prev => prev.filter(r => r.id !== newRipple.id)), 2500);
-    
     setRandomSpots(prev => prev.filter(s => s.id !== id));
     setTimeout(() => setRandomSpots(prev =>[...prev, { id: Math.random(), deg: -70 + Math.random() * 140, size: 0.6 + Math.random() * 0.8 }]), 500);
   };
@@ -185,8 +244,7 @@ const CabinUI = ({
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="relative h-screen flex flex-col items-center justify-center overflow-hidden w-full"
       onMouseDown={() => { if(cabinMode === 'pose-confirm') setIsPressing(true); }} 
-      onMouseUp={() => setIsPressing(false)} 
-      onMouseLeave={() => setIsPressing(false)}
+      onMouseUp={() => setIsPressing(false)} onMouseLeave={() => setIsPressing(false)}
     >
       <div className="absolute inset-0 bg-[#4FACFE]/5 pointer-events-none" />
 
@@ -219,7 +277,6 @@ const CabinUI = ({
 
       <div className="absolute w-[800px] h-[400px] border-t-[40px] border-[#4FACFE]/10 rounded-t-[400px] bottom-[-50px] pointer-events-none" style={{ maskImage: 'linear-gradient(to bottom, black 50%, transparent 100%)' }} />
 
-      {/* 【修复点】：z-40 层级确保拖拽和点击完全置顶，不受任何元素的阻挡 */}
       <div className="absolute bottom-[-50px] w-[800px] h-[800px] rounded-full flex items-center justify-center pointer-events-none z-40">
         
         {cabinMode === 'pose-confirm' && (
@@ -235,15 +292,12 @@ const CabinUI = ({
           </>
         )}
 
-        {/* 精神充能：修复出场突兀与大小错落 */}
+        {/* 精神充能：拖拽收拢 */}
         {cabinMode === 'recharge' && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             {balls.map((ball) => (
               !ball.isConsumed && (
-                <motion.div
-                  key={ball.id}
-                  drag
-                  dragConstraints={{ left: -400, right: 400, top: -300, bottom: 300 }}
+                <motion.div key={ball.id} drag dragConstraints={{ left: -400, right: 400, top: -300, bottom: 300 }}
                   onDragEnd={(_, info) => {
                     const centerX = window.innerWidth / 2;
                     const centerY = window.innerHeight / 2;
@@ -251,10 +305,10 @@ const CabinUI = ({
                     
                     if (dist < 120) {
                       setBalls(prev => prev.map(b => b.id === ball.id ? { ...b, isConsumed: true } : b));
-                      setPushProgress(p => Math.min(p + 20, 100)); 
+                      // 瞬间爆发出强烈的光晕，然后交给 useEffect 自动衰减
+                      setPushProgress(100); 
                     }
                   }}
-                  // 出场时带有柔和的放大和渐变效果，不突兀
                   initial={{ scale: 0, opacity: 0, x: ball.x, y: ball.y }}
                   animate={{ scale: ball.isConsumed ? 0 : ball.size, opacity: ball.isConsumed ? 0 : 1 }}
                   transition={{ duration: ball.isConsumed ? 0.3 : 0.8, ease: ball.isConsumed ? "backIn" : "easeOut" }}
@@ -265,24 +319,24 @@ const CabinUI = ({
                 </motion.div>
               )
             ))}
-            <div className="absolute w-48 h-48 rounded-full bg-[#4FACFE] blur-[60px] transition-all duration-300 pointer-events-none" style={{ opacity: (pushProgress / 100) * 0.8, transform: `scale(${0.3 + (pushProgress / 100) * 0.7})` }} />
+            
+            {/* 中心爆发光晕，因为 pushProgress 会自动减少，所以它会呈现高级的脉冲消散感 */}
+            <div className="absolute w-64 h-64 rounded-full bg-[#4FACFE] blur-[60px] transition-all duration-75 pointer-events-none" 
+                 style={{ opacity: (pushProgress / 100) * 0.8, transform: `scale(${0.5 + (pushProgress / 100) * 0.8})` }} />
+                 
             <div className="absolute text-center mt-[450px] pointer-events-none">
               <p className="text-[#4FACFE] tracking-[0.3em] text-sm">将散落的思维球拖动至中心聚拢</p>
             </div>
           </div>
         )}
 
-        {/* 灵感触发：随机绽放光球 */}
+        {/* 灵感触发 */}
         {cabinMode === 'inspiration' && (
           <AnimatePresence>
             {randomSpots.map(spot => (
-              <motion.div key={spot.id} 
-                initial={{ opacity: 0, scale: 0 }} 
-                animate={{ opacity: 1, scale: spot.size }} 
-                exit={{ opacity: 0, scale: spot.size * 3, filter: 'blur(10px)' }} 
+              <motion.div key={spot.id} initial={{ opacity: 0, scale: 0 }} animate={{ opacity: 1, scale: spot.size }} exit={{ opacity: 0, scale: spot.size * 3, filter: 'blur(10px)' }} 
                 transition={{ duration: 0.5, ease: "easeOut" }}
                 className="absolute w-full h-full flex items-start justify-center pointer-events-none" style={{ rotate: `${spot.deg}deg` }}>
-                {/* 注意：这里的光球置顶并且 pointer-events-auto，不再受中心遮挡 */}
                 <div className="w-16 h-16 -mt-8 rounded-full border border-white/30 bg-white/10 backdrop-blur-md flex items-center justify-center cursor-pointer pointer-events-auto hover:bg-white/30 hover:shadow-[0_0_20px_rgba(255,255,255,0.4)] transition-all shadow-[0_0_15px_rgba(255,255,255,0.1)]"
                   onMouseDown={(e) => handleSpotClick(e, spot.id)}>
                   <motion.div animate={{ scale:[1, 1.5, 1], opacity:[0.8, 0, 0.8] }} transition={{ duration: 1.5 + spot.size, repeat: Infinity }} className="absolute w-4 h-4 bg-white rounded-full blur-[2px]" />
@@ -293,9 +347,9 @@ const CabinUI = ({
         )}
       </div>
 
-      {/* 【修复点】：给中心 Logo 加入 pointer-events-none，让它变成纯视觉层，点击/拖拽直接穿透！ */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-         <SyncLogo className="mb-24 scale-[0.8]" isSyncing={pushProgress > 80 || cabinMode === 'inspiration'} />
+         {/* 这里的 isSyncing 改为跟随光晕，光晕亮起时中心变大 */}
+         <SyncLogo className="mb-24 scale-[0.8]" isSyncing={pushProgress > 20 || cabinMode === 'inspiration'} />
       </div>
 
       <div className="absolute inset-0 pointer-events-none overflow-hidden">
@@ -354,7 +408,6 @@ const MobileUI = ({
           <motion.div animate={{ scale:[1, 1.05, 1], opacity:[0.8, 1, 0.8] }} transition={{ duration: 4, repeat: Infinity, ease: "easeInOut" }}>
             <SyncLogo size="large" className="mb-12" />
           </motion.div>
-          {/* 【修复点】：减少了这里的 margin-bottom，从而把“进入系统”按钮往上提了 */}
           <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.5 }} className="flex flex-col items-center mb-8">
             <h1 className="text-5xl font-bold tracking-[0.3em] sync-text-gradient mb-2" style={{ paddingLeft: '0.3em' }}>心跃</h1>
             <h2 className="text-3xl font-bold tracking-[0.4em] sync-text-gradient opacity-90" style={{ paddingLeft: '0.4em' }}>SYNC</h2>
@@ -471,8 +524,8 @@ const MobileUI = ({
 // 4. 主应用路由
 // ==========================================
 export default function App() {
-  const [view, setView] = useState<'cabin' | 'mobile'>('mobile');
-  const [cabinMode, setCabinMode] = useState<CabinMode>('idle');
+  const[view, setView] = useState<'cabin' | 'mobile'>('mobile');
+  const[cabinMode, setCabinMode] = useState<CabinMode>('idle');
   const[targetMode, setTargetMode] = useState<CabinMode | null>(null);
   const[mobileState, setMobileState] = useState<MobileState>('home');
   const[isTransitioning, setIsTransitioning] = useState(false);
